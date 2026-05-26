@@ -1,0 +1,16 @@
+# Install in R: install.packages(c(...))
+tidyverse
+scales
+corrplot
+patchwork
+plotly
+caret
+glmnet
+randomForest
+xgboost
+e1071
+pROC
+vip
+MLmetrics
+GGally
+rmarkdown

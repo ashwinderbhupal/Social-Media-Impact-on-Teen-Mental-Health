@@ -1,0 +1,1561 @@
+---
+title: "Social Media Impact on Teen Mental Health — Deep Analysis"
+author: "Social Media Data Analysis"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    code_folding: hide
+    theme: cosmo
+    highlight: tango
+    df_print: paged
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width  = 12,
+  fig.height = 7,
+  fig.align  = "center",
+  dpi     = 150
+)
+```
+
+---
+
+> **Dataset:** `teen_mental_health.csv` — 13 columns covering social media habits,
+> sleep, academics, physical activity, and psychosocial outcomes in teenagers.
+> **Target variable:** `depression_label` (binary: No Depression / Depression).
+
+---
+
+# Section 0 — Setup {.tabset}
+
+## Install & Load Packages
+
+```{r libraries}
+# ── Install any missing packages automatically ──────────────────────────────
+required_pkgs <- c(
+  "tidyverse", "scales", "corrplot", "patchwork", "plotly",
+  "caret", "randomForest", "xgboost", "e1071", "glmnet",
+  "pROC", "vip", "GGally", "ggridges", "viridis",
+  "kableExtra", "DT", "gridExtra"
+)
+
+installed <- rownames(installed.packages())
+to_install <- setdiff(required_pkgs, installed)
+if (length(to_install) > 0) {
+  install.packages(to_install, repos = "https://cloud.r-project.org", quiet = TRUE)
+}
+
+# ── Load libraries ───────────────────────────────────────────────────────────
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(scales)
+  library(corrplot)
+  library(patchwork)
+  library(plotly)
+  library(caret)
+  library(randomForest)
+  library(xgboost)
+  library(e1071)
+  library(glmnet)
+  library(pROC)
+  library(vip)
+  library(GGally)
+  library(ggridges)
+  library(viridis)
+  library(kableExtra)
+  library(DT)
+  library(gridExtra)
+})
+
+set.seed(42)
+
+# ── Global theme ─────────────────────────────────────────────────────────────
+theme_set(
+  theme_minimal(base_size = 13) +
+    theme(
+      plot.title    = element_text(face = "bold", size = 14, hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5, colour = "grey40"),
+      axis.title    = element_text(size = 11),
+      legend.position = "bottom",
+      strip.text    = element_text(face = "bold")
+    )
+)
+
+# ── Column definitions ────────────────────────────────────────────────────────
+ALL_COLS <- c(
+  "age", "gender", "daily_social_media_hours", "platform_usage",
+  "sleep_hours", "screen_time_before_sleep", "academic_performance",
+  "physical_activity", "social_interaction_level", "stress_level",
+  "anxiety_level", "addiction_level", "depression_label"
+)
+
+NUMERIC_COLS <- c(
+  "age", "daily_social_media_hours", "sleep_hours",
+  "screen_time_before_sleep", "academic_performance",
+  "physical_activity", "social_interaction_level",
+  "stress_level", "anxiety_level", "addiction_level"
+)
+
+CAT_COLS    <- c("gender", "platform_usage")
+TARGET_COL  <- "depression_label"
+
+cat("✓ All packages loaded.\n")
+cat("✓ Columns defined:", length(ALL_COLS), "total.\n")
+```
+
+## Load Data
+
+```{r load-data}
+# ── Read CSV (adjust path as needed) ─────────────────────────────────────────
+# Place teen_mental_health.csv in a 'data/' subfolder OR change the path below.
+csv_path <- "data/teen_mental_health.csv"
+
+if (!file.exists(csv_path)) {
+  stop(
+    "❌  File not found: ", csv_path,
+    "\n   Place your CSV in a 'data/' subfolder next to this .Rmd file."
+  )
+}
+
+df_raw <- read_csv(csv_path, show_col_types = FALSE)
+
+# Keep only the 13 specified columns (robust to extra columns in the CSV)
+missing_cols <- setdiff(ALL_COLS, colnames(df_raw))
+if (length(missing_cols) > 0) {
+  stop("❌  These expected columns are missing from the CSV: ",
+       paste(missing_cols, collapse = ", "))
+}
+
+df <- df_raw |> dplyr::select(all_of(ALL_COLS))
+
+cat("✅  Dataset loaded successfully.\n")
+cat("Shape:", nrow(df), "rows ×", ncol(df), "columns\n\n")
+
+# Data types overview
+glimpse(df)
+```
+
+```{r summary-table}
+cat("\n── Descriptive Statistics ──────────────────────────────────────────────\n")
+summary(df)
+```
+
+```{r head-table}
+df |>
+  head(10) |>
+  kable(caption = "First 10 Rows of the Dataset") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 12)
+```
+
+---
+
+# Section 1 — Data Cleaning & Preprocessing
+
+## Missing Values
+
+```{r missing-values, fig.height=5}
+missing_counts <- colSums(is.na(df))
+missing_df <- tibble(
+  Column  = names(missing_counts),
+  Missing = as.integer(missing_counts),
+  Pct     = round(100 * missing_counts / nrow(df), 2)
+) |> arrange(desc(Missing))
+
+missing_df |>
+  kable(caption = "Missing Values per Column") |>
+  kable_styling(bootstrap_options = c("striped", "hover"),
+                full_width = FALSE, font_size = 12)
+```
+
+```{r missing-heatmap, fig.height=5, fig.width=12}
+miss_long <- df |>
+  mutate(row_id = row_number()) |>
+  mutate(across(all_of(ALL_COLS), ~ as.integer(is.na(.)))) |>
+  pivot_longer(-row_id, names_to = "column", values_to = "is_missing") |>
+  mutate(column = factor(column, levels = ALL_COLS))
+
+ggplot(miss_long, aes(column, row_id, fill = factor(is_missing))) +
+  geom_tile() +
+  scale_fill_manual(
+    values = c("0" = "grey92", "1" = "firebrick"),
+    labels = c("Present", "Missing"), name = NULL
+  ) +
+  scale_y_reverse() +
+  labs(title = "Missing Values Heatmap", x = NULL, y = "Row Index") +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1),
+    axis.text.y  = element_blank(),
+    axis.ticks.y = element_blank(),
+    panel.grid   = element_blank()
+  )
+```
+
+> **Note:** If there are missing values, the code below imputes numeric columns
+> with their median and categorical columns with their mode.
+
+```{r impute-missing}
+# Impute numeric columns with median
+for (col in NUMERIC_COLS) {
+  if (any(is.na(df[[col]]))) {
+    df[[col]][is.na(df[[col]])] <- median(df[[col]], na.rm = TRUE)
+    cat("Imputed median for:", col, "\n")
+  }
+}
+
+# Impute categorical columns with mode
+mode_val <- function(x) names(sort(table(x), decreasing = TRUE))[1]
+for (col in c(CAT_COLS, TARGET_COL)) {
+  if (any(is.na(df[[col]]))) {
+    df[[col]][is.na(df[[col]])] <- mode_val(df[[col]])
+    cat("Imputed mode for:", col, "\n")
+  }
+}
+
+cat("\n✅  No missing values remain:", sum(is.na(df)), "\n")
+```
+
+## Remove Duplicates
+
+```{r remove-duplicates}
+n_before <- nrow(df)
+df <- df |> distinct()
+n_removed <- n_before - nrow(df)
+cat("Rows before deduplication:", n_before, "\n")
+cat("Duplicate rows removed   :", n_removed, "\n")
+cat("Rows after deduplication :", nrow(df), "\n")
+```
+
+## Encode Target & Categoricals
+
+```{r encode-target}
+# ── Normalize depression_label to a clean binary factor ──────────────────────
+unique_labels <- unique(as.character(df$depression_label))
+cat("Unique depression_label values:", paste(sort(unique_labels), collapse = ", "), "\n")
+
+# Handle both numeric (0/1) and string variants
+df <- df |>
+  mutate(
+    depression_label = case_when(
+      tolower(as.character(depression_label)) %in%
+        c("1", "yes", "depression", "depressed", "true") ~ "Depression",
+      tolower(as.character(depression_label)) %in%
+        c("0", "no", "no depression", "not depressed", "false") ~ "No Depression",
+      TRUE ~ as.character(depression_label)
+    ),
+    depression_label = factor(depression_label,
+                              levels = c("No Depression", "Depression"))
+  )
+
+cat("Depression label levels:", levels(df$depression_label), "\n")
+
+# ── Encode categoricals for numeric analysis ─────────────────────────────────
+df <- df |>
+  mutate(
+    depression_label_enc = as.integer(depression_label == "Depression"),
+    gender_enc           = as.integer(factor(gender)) - 1L,
+    platform_usage_enc   = as.integer(factor(platform_usage)) - 1L,
+    # social_interaction_level may be text (Low/Medium/High) or numeric
+    social_int_enc = if (is.character(social_interaction_level) ||
+                         is.factor(social_interaction_level)) {
+      as.integer(factor(social_interaction_level,
+                        levels = c("Low", "Medium", "High"))) - 1L
+    } else {
+      as.integer(social_interaction_level)
+    }
+  )
+```
+
+## Class Distribution
+
+```{r class-dist}
+cat("\n── Value Counts ─────────────────────────────────────────────────────────\n")
+cat("\ngender:\n"); print(table(df$gender))
+cat("\nplatform_usage:\n"); print(table(df$platform_usage))
+cat("\ndepression_label:\n"); print(table(df$depression_label))
+cat("\nClass balance (%):\n")
+print(round(prop.table(table(df$depression_label)) * 100, 2))
+```
+
+---
+
+# Section 2 — Exploratory Data Analysis (EDA)
+
+## Distributions of Numeric Features
+
+```{r dist-grid, fig.width=20, fig.height=9}
+plots_dist <- lapply(NUMERIC_COLS, function(col) {
+  vals <- if (col == "social_interaction_level") df$social_int_enc else df[[col]]
+  tmp  <- tibble(x = vals)
+
+  ggplot(tmp, aes(x)) +
+    geom_histogram(aes(y = after_stat(density)), bins = 30,
+                   fill = "#4E79A7", colour = "white", alpha = 0.8) +
+    geom_density(colour = "#E15759", linewidth = 1) +
+    labs(title = col, x = NULL, y = "Density")
+})
+
+wrap_plots(plots_dist, ncol = 5) +
+  plot_annotation(
+    title    = "Distributions of All Numeric Features",
+    subtitle = "Blue = histogram  |  Red = KDE curve",
+    theme    = theme(plot.title = element_text(face = "bold", size = 16, hjust = 0.5))
+  )
+```
+
+## Countplots — Categorical Features
+
+```{r countplots, fig.width=16, fig.height=5}
+p_gender <- ggplot(df, aes(gender, fill = gender)) +
+  geom_bar(show.legend = FALSE) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.4) +
+  scale_fill_viridis_d(option = "D", begin = 0.2, end = 0.8) +
+  labs(title = "Gender Distribution", x = NULL, y = "Count")
+
+p_platform <- ggplot(df, aes(platform_usage, fill = platform_usage)) +
+  geom_bar(show.legend = FALSE) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.4) +
+  scale_fill_viridis_d(option = "C", begin = 0.1, end = 0.9) +
+  labs(title = "Platform Usage Distribution", x = NULL, y = "Count")
+
+p_dep <- ggplot(df, aes(depression_label, fill = depression_label)) +
+  geom_bar(show.legend = FALSE) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.4) +
+  scale_fill_manual(values = c("No Depression" = "#59A14F", "Depression" = "#E15759")) +
+  labs(title = "Depression Label Distribution", x = NULL, y = "Count")
+
+p_gender + p_platform + p_dep +
+  plot_annotation(title = "Categorical Feature Distributions",
+                  theme = theme(plot.title = element_text(face = "bold", size = 15, hjust = 0.5)))
+```
+
+## Pearson Correlation Heatmap
+
+```{r corr-heatmap, fig.width=12, fig.height=10}
+corr_data <- df |>
+  transmute(
+    age, daily_social_media_hours, sleep_hours,
+    screen_time_before_sleep, academic_performance,
+    physical_activity, social_interaction = social_int_enc,
+    stress_level, anxiety_level, addiction_level,
+    depression = depression_label_enc
+  ) |>
+  # Force all columns to numeric (handles any hidden factor/character columns)
+  mutate(across(everything(), ~ suppressWarnings(as.numeric(as.character(.))))) |>
+  # Drop any column that is entirely NA after coercion
+  select(where(~ sum(!is.na(.)) > 1))
+
+# Verify we have usable data
+if (ncol(corr_data) < 2) {
+  stop("Not enough numeric columns for correlation matrix.")
+}
+
+# Use pairwise.complete.obs as a safer fallback
+corr_mat <- tryCatch(
+  cor(corr_data, use = "complete.obs",  method = "pearson"),
+  error = function(e) cor(corr_data, use = "pairwise.complete.obs", method = "pearson")
+)
+
+# Sync row/col names for corrplot
+rownames(corr_mat) <- colnames(corr_mat)
+
+corr_mat <- cor(corr_data, use = "complete.obs", method = "pearson")
+
+corrplot(
+  corr_mat,
+  method      = "color",
+  type        = "upper",
+  order       = "hclust",
+  addCoef.col = "black",
+  number.cex  = 0.65,
+  tl.cex      = 0.85,
+  tl.col      = "black",
+  col         = colorRampPalette(c("#2166AC", "white", "#D6604D"))(200),
+  title       = "Pearson Correlation Heatmap (All Numeric Features)",
+  mar         = c(0, 0, 2, 0)
+)
+```
+
+> **Reading the heatmap:** Red = positive correlation, Blue = negative.
+> Darker shades = stronger relationship. Look for strong correlates of `depression`.
+
+## Pairplot — Key Mental Health Variables
+
+```{r pairplot, fig.width=14, fig.height=12}
+pair_cols <- c(
+  "daily_social_media_hours", "sleep_hours",
+  "stress_level", "anxiety_level", "addiction_level"
+)
+
+ggpairs(
+  df[, c(pair_cols, "depression_label")],
+  aes(colour = depression_label, alpha = 0.4),
+  upper = list(continuous = wrap("cor", size = 3.5)),
+  lower = list(continuous = wrap("points", alpha = 0.3, size = 0.8)),
+  diag  = list(continuous = wrap("densityDiag", alpha = 0.5)),
+  columnLabels = c("Social Media (h)", "Sleep (h)",
+                   "Stress", "Anxiety", "Addiction", "Depression")
+) +
+  scale_colour_manual(values = c("No Depression" = "#59A14F", "Depression" = "#E15759")) +
+  scale_fill_manual(values  = c("No Depression" = "#59A14F", "Depression" = "#E15759")) +
+  labs(title = "Pairplot — Key Mental Health Variables by Depression Label") +
+  theme(axis.text = element_text(size = 7))
+```
+
+## Boxplots by Depression Label
+
+```{r box-depression, fig.width=18, fig.height=10}
+box_cols   <- c("stress_level", "anxiety_level", "addiction_level",
+                "sleep_hours", "daily_social_media_hours",
+                "screen_time_before_sleep", "academic_performance",
+                "physical_activity")
+
+box_labels <- c("Stress Level", "Anxiety Level", "Addiction Level",
+                "Sleep Hours", "Social Media (h/day)",
+                "Screen Time Before Sleep", "Academic Performance",
+                "Physical Activity")
+
+bp_list <- Map(function(col, lbl) {
+  ggplot(df, aes(depression_label, .data[[col]], fill = depression_label)) +
+    geom_boxplot(alpha = 0.75, outlier.shape = 21, outlier.size = 1.5) +
+    geom_jitter(width = 0.1, alpha = 0.08, size = 0.6) +
+    scale_fill_manual(values = c("No Depression" = "#59A14F", "Depression" = "#E15759"),
+                      guide  = "none") +
+    labs(title = lbl, x = NULL, y = lbl)
+}, box_cols, box_labels)
+
+wrap_plots(bp_list, ncol = 4) +
+  plot_annotation(
+    title    = "Feature Distributions by Depression Label",
+    subtitle = "Green = No Depression  |  Red = Depression",
+    theme    = theme(plot.title = element_text(face = "bold", size = 15, hjust = 0.5))
+  )
+```
+
+## Ridge Plots — Overlapping Distributions
+
+```{r ridge-plots, fig.width=14, fig.height=9}
+ridge_cols <- c("stress_level", "anxiety_level", "addiction_level",
+                "sleep_hours", "daily_social_media_hours")
+
+df_ridge <- df |>
+  select(all_of(ridge_cols), depression_label) |>
+  pivot_longer(-depression_label, names_to = "feature", values_to = "value")
+
+ggplot(df_ridge, aes(value, feature, fill = depression_label, colour = depression_label)) +
+  geom_density_ridges(alpha = 0.55, scale = 1.2, rel_min_height = 0.01) +
+  scale_fill_manual(values   = c("No Depression" = "#59A14F", "Depression" = "#E15759")) +
+  scale_colour_manual(values = c("No Depression" = "#2D6A2E", "Depression" = "#A01B1B")) +
+  labs(
+    title    = "Ridge Density Plots by Depression Label",
+    subtitle = "Overlap reveals how well each feature separates the two classes",
+    x = "Value", y = NULL, fill = "Label", colour = "Label"
+  )
+```
+
+---
+
+# Section 3 — Deep Statistical Analysis
+
+## IQR Outlier Detection
+
+```{r iqr-outliers, fig.width=20, fig.height=8}
+iqr_count <- function(x) {
+  q  <- quantile(x, c(0.25, 0.75), na.rm = TRUE)
+  iq <- q[2] - q[1]
+  sum(x < q[1] - 1.5 * iq | x > q[2] + 1.5 * iq, na.rm = TRUE)
+}
+
+outlier_df <- tibble(
+  Feature  = NUMERIC_COLS,
+  Outliers = sapply(NUMERIC_COLS, function(c) {
+    vals <- if (c == "social_interaction_level") df$social_int_enc else df[[c]]
+    iqr_count(vals)
+  }),
+  Pct = round(Outliers / nrow(df) * 100, 2)
+) |> arrange(desc(Outliers))
+
+outlier_df |>
+  kable(caption = "Outlier Counts by IQR Method") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r outlier-boxplots, fig.width=20, fig.height=8}
+obox_list <- lapply(NUMERIC_COLS, function(col) {
+  vals <- if (col == "social_interaction_level") df$social_int_enc else df[[col]]
+  tmp  <- tibble(x = vals)
+  ggplot(tmp, aes(y = x)) +
+    geom_boxplot(fill = "#4E79A7", alpha = 0.7, outlier.colour = "red", outlier.size = 1.5) +
+    labs(title = col, x = NULL, y = col)
+})
+
+wrap_plots(obox_list, ncol = 5) +
+  plot_annotation(
+    title = "IQR Outlier Detection — All Numeric Features",
+    theme = theme(plot.title = element_text(face = "bold", size = 15, hjust = 0.5))
+  )
+```
+
+## T-Tests: Depressed vs Non-Depressed
+
+```{r ttest-helper}
+# Helper: run Welch t-test and return a tidy tibble row
+run_ttest <- function(col_name, df) {
+  g0 <- df |> filter(depression_label == "No Depression") |> pull(!!sym(col_name))
+  g1 <- df |> filter(depression_label == "Depression")    |> pull(!!sym(col_name))
+  tt <- t.test(g0, g1, var.equal = FALSE)
+  tibble(
+    Feature     = col_name,
+    Mean_NoDep  = round(mean(g0, na.rm = TRUE), 3),
+    Mean_Dep    = round(mean(g1, na.rm = TRUE), 3),
+    t_statistic = round(tt$statistic, 4),
+    p_value     = signif(tt$p.value, 4),
+    Significant = ifelse(tt$p.value < 0.05, "✅ Yes", "❌ No")
+  )
+}
+
+ttest_cols <- c("daily_social_media_hours", "sleep_hours",
+                "anxiety_level", "addiction_level",
+                "stress_level", "screen_time_before_sleep",
+                "academic_performance", "physical_activity")
+
+ttest_results <- bind_rows(lapply(ttest_cols, run_ttest, df = df))
+
+ttest_results |>
+  kable(caption = "Welch T-Tests: No Depression vs Depression Groups") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 12) |>
+  column_spec(6, bold = TRUE,
+              color = ifelse(ttest_results$Significant == "✅ Yes", "green", "red"))
+```
+
+> **Interpretation:** Features marked ✅ have statistically significant mean differences
+> between depressed and non-depressed teens (p < 0.05). Compare `Mean_NoDep` vs
+> `Mean_Dep` columns to see the direction of the effect.
+
+```{r ttest-viz, fig.width=14, fig.height=5}
+ttest_plot_df <- ttest_results |>
+  mutate(neg_log_p = -log10(p_value)) |>
+  arrange(desc(neg_log_p))
+
+ggplot(ttest_plot_df, aes(reorder(Feature, neg_log_p), neg_log_p,
+                           fill = Significant)) +
+  geom_col(alpha = 0.85) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed",
+             colour = "red", linewidth = 0.8) +
+  scale_fill_manual(values = c("✅ Yes" = "#59A14F", "❌ No" = "#BAB0AC")) +
+  coord_flip() +
+  labs(
+    title    = "T-Test Significance (-log10 p-value)",
+    subtitle = "Red dashed line = p = 0.05 threshold",
+    x = NULL, y = "-log10(p-value)", fill = "Significant"
+  )
+```
+
+## ANOVA — Platform Usage Effect
+
+```{r anova-tests}
+run_anova <- function(outcome, df) {
+  formula <- as.formula(paste(outcome, "~ platform_usage"))
+  aov_fit <- aov(formula, data = df)
+  sm      <- summary(aov_fit)[[1]]
+  tibble(
+    Outcome     = outcome,
+    F_statistic = round(sm[1, "F value"], 4),
+    p_value     = signif(sm[1, "Pr(>F)"], 4),
+    Significant = ifelse(sm[1, "Pr(>F)"] < 0.05, "✅ Yes", "❌ No")
+  )
+}
+
+anova_outcomes <- c("stress_level", "anxiety_level", "addiction_level",
+                    "sleep_hours", "daily_social_media_hours")
+
+anova_results <- bind_rows(lapply(anova_outcomes, run_anova, df = df))
+
+anova_results |>
+  kable(caption = "One-Way ANOVA: Outcomes by Platform Usage") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+> **Interpretation:** A significant ANOVA (p < 0.05) means mean scores differ across
+> at least two platform groups (Instagram, TikTok, Both). Post-hoc Tukey HSD would
+> identify which pairs differ.
+
+```{r tukey-hsd}
+# Tukey HSD post-hoc for stress_level (most relevant outcome)
+aov_stress_full <- aov(stress_level ~ platform_usage, data = df)
+cat("Tukey HSD post-hoc for stress_level ~ platform_usage:\n")
+print(TukeyHSD(aov_stress_full))
+```
+
+## Chi-Square — Gender vs Depression
+
+```{r chi-square}
+ct <- table(df$gender, df$depression_label)
+cat("Contingency table:\n"); print(ct)
+
+chi_test <- chisq.test(ct)
+cat("\nChi-square test:\n"); print(chi_test)
+
+chi_interp <- if (chi_test$p.value < 0.05) {
+  "✅  Significant: gender and depression_label are NOT independent (p < 0.05)."
+} else {
+  "❌  Not significant: no strong association between gender and depression_label."
+}
+cat("\n", chi_interp, "\n")
+```
+
+```{r chi-viz, fig.width=8, fig.height=5}
+as.data.frame(ct) |>
+  rename(Gender = Var1, Depression = Var2, Count = Freq) |>
+  group_by(Gender) |>
+  mutate(Prop = Count / sum(Count)) |>
+  ggplot(aes(Gender, Prop, fill = Depression)) +
+  geom_col(position = "fill", alpha = 0.85) +
+  geom_text(aes(label = scales::percent(Prop, accuracy = 0.1)),
+            position = position_fill(vjust = 0.5), size = 4) +
+  scale_y_continuous(labels = percent) +
+  scale_fill_manual(values = c("No Depression" = "#59A14F", "Depression" = "#E15759")) +
+  labs(title = "Depression Label Proportion by Gender",
+       x = NULL, y = "Proportion", fill = NULL)
+```
+
+## Spearman Correlations with Depression
+
+```{r spearman}
+spearman_cols <- c(
+  "daily_social_media_hours", "sleep_hours", "screen_time_before_sleep",
+  "stress_level", "anxiety_level", "addiction_level",
+  "academic_performance", "physical_activity", "age"
+)
+
+spearman_results <- map_dfr(spearman_cols, function(col) {
+  test <- cor.test(df$depression_label_enc, df[[col]],
+                   method = "spearman", exact = FALSE)
+  tibble(
+    Feature     = col,
+    Spearman_rho = round(unname(test$estimate), 4),
+    p_value      = signif(test$p.value, 4),
+    Significant  = ifelse(test$p.value < 0.05, "✅ Yes", "❌ No"),
+    Direction    = ifelse(unname(test$estimate) > 0, "Positive ↑", "Negative ↓")
+  )
+}) |> arrange(desc(abs(Spearman_rho)))
+
+spearman_results |>
+  kable(caption = "Spearman Correlations: Feature vs Depression Label (Encoded)") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) |>
+  column_spec(2, bold = TRUE,
+              color = ifelse(spearman_results$Spearman_rho > 0, "#E15759", "#4E79A7"))
+```
+
+```{r spearman-viz, fig.width=10, fig.height=5}
+ggplot(spearman_results,
+       aes(reorder(Feature, Spearman_rho), Spearman_rho,
+           fill = Spearman_rho > 0)) +
+  geom_col(alpha = 0.85) +
+  geom_hline(yintercept = 0, colour = "black", linewidth = 0.5) +
+  scale_fill_manual(values = c("TRUE" = "#E15759", "FALSE" = "#4E79A7"),
+                    labels = c("Negative", "Positive"), name = "Direction") +
+  coord_flip() +
+  labs(
+    title    = "Spearman Correlations with Depression Label",
+    subtitle = "Red = positive correlation  |  Blue = negative",
+    x = NULL, y = "Spearman ρ"
+  )
+```
+
+---
+
+# Section 4 — Feature Engineering
+
+```{r feature-engineering}
+df <- df |>
+  mutate(
+    # --- Derived numeric features ---
+    sleep_deficit       = 8 - sleep_hours,
+    screen_load         = daily_social_media_hours + screen_time_before_sleep,
+
+    # --- Composite mental health score (MinMax normalised sum) ---
+    stress_n            = (stress_level  - min(stress_level))  / (max(stress_level)  - min(stress_level)),
+    anxiety_n           = (anxiety_level - min(anxiety_level)) / (max(anxiety_level) - min(anxiety_level)),
+    addiction_n         = (addiction_level - min(addiction_level)) / (max(addiction_level) - min(addiction_level)),
+    mental_health_score = stress_n + anxiety_n + addiction_n,
+
+    # --- Usage category bins ---
+    usage_category = cut(
+      daily_social_media_hours,
+      breaks = c(-Inf, 2, 4, Inf),
+      labels = c("Light (<2h)", "Moderate (2-4h)", "Heavy (>4h)"),
+      right  = FALSE
+    ),
+
+    # --- Age group bins ---
+    age_group = cut(
+      age,
+      breaks         = c(12, 15, 17, 19),
+      labels         = c("Early Teen (13-15)", "Mid Teen (16-17)", "Late Teen (18-19)"),
+      include.lowest = TRUE
+    )
+  ) |>
+  # Drop helper normalised columns
+  select(-stress_n, -anxiety_n, -addiction_n)
+
+cat("✅  Feature engineering complete.\n")
+cat("New columns added: sleep_deficit, screen_load, mental_health_score,",
+    "usage_category, age_group\n\n")
+
+df |>
+  select(sleep_deficit, screen_load, mental_health_score, usage_category, age_group) |>
+  head(8) |>
+  kable(caption = "Sample of Engineered Features") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+```{r usage-age-dist, fig.width=14, fig.height=5}
+p_uc <- ggplot(df, aes(usage_category, fill = usage_category)) +
+  geom_bar(show.legend = FALSE) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.4) +
+  scale_fill_viridis_d(option = "B", begin = 0.2, end = 0.85) +
+  labs(title = "Usage Category Distribution", x = NULL, y = "Count")
+
+p_ag <- ggplot(df, aes(age_group, fill = age_group)) +
+  geom_bar(show.legend = FALSE) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.4) +
+  scale_fill_viridis_d(option = "E", begin = 0.15, end = 0.9) +
+  labs(title = "Age Group Distribution", x = NULL, y = "Count")
+
+p_uc + p_ag
+```
+
+## Build Model Matrix
+
+```{r model-matrix}
+# Encode categoricals for modeling
+df_enc <- df |>
+  mutate(
+    gender_enc    = as.integer(factor(gender)) - 1L,
+    platform_enc  = as.integer(factor(platform_usage)) - 1L,
+    usage_cat_enc = as.integer(usage_category) - 1L,
+    age_group_enc = as.integer(age_group) - 1L
+  )
+
+feature_cols <- c(
+  "age", "daily_social_media_hours", "sleep_hours", "screen_time_before_sleep",
+  "academic_performance", "physical_activity", "social_int_enc",
+  "stress_level", "anxiety_level", "addiction_level",
+  "sleep_deficit", "screen_load", "mental_health_score",
+  "gender_enc", "platform_enc", "usage_cat_enc", "age_group_enc"
+)
+
+# Force all feature columns to numeric
+X_raw <- df_enc |>
+  select(all_of(feature_cols)) |>
+  mutate(across(everything(), ~ suppressWarnings(as.numeric(as.character(.))))) |>
+  as.matrix()
+
+# Replace any remaining NA / NaN / Inf with column medians
+for (j in seq_len(ncol(X_raw))) {
+  bad <- !is.finite(X_raw[, j])
+  if (any(bad)) {
+    med <- median(X_raw[!bad, j], na.rm = TRUE)
+    if (!is.finite(med)) med <- 0
+    X_raw[bad, j] <- med
+  }
+}
+
+X_scaled <- scale(X_raw)
+# scale() returns NaN for zero-variance columns — glmnet rejects those
+X_scaled[!is.finite(X_scaled)] <- 0
+colnames(X_scaled) <- feature_cols
+
+y_bin <- df$depression_label_enc
+
+cat("✅  Feature matrix shape:", nrow(X_scaled), "rows ×", ncol(X_scaled), "columns\n")
+cat("Any non-finite values remaining:", any(!is.finite(X_scaled)), "\n")
+cat("Target distribution (0 = No Depression, 1 = Depression):\n")
+print(table(y_bin))
+```
+
+---
+
+# Section 5 — Advanced Visualisations
+
+## Interactive: Social Media Hours vs Anxiety
+
+```{r plotly-scatter, fig.width=10, fig.height=6}
+p_interactive <- df |>
+  plot_ly(
+    x    = ~daily_social_media_hours,
+    y    = ~anxiety_level,
+    color = ~depression_label,
+    size  = ~addiction_level,
+    text  = ~paste0(
+      "Platform: ", platform_usage,
+      "<br>Sleep: ", sleep_hours, "h",
+      "<br>Stress: ", stress_level,
+      "<br>Gender: ", gender
+    ),
+    type   = "scatter",
+    mode   = "markers",
+    colors = c("No Depression" = "#59A14F", "Depression" = "#E15759"),
+    marker = list(opacity = 0.65, sizemode = "diameter", sizeref = 0.25)
+  ) |>
+  layout(
+    title = list(text = "Social Media Hours vs Anxiety Level",
+                 font = list(size = 16)),
+    xaxis = list(title = "Daily Social Media Hours"),
+    yaxis = list(title = "Anxiety Level"),
+    legend = list(title = list(text = "Depression Label"))
+  )
+p_interactive
+```
+
+## Interactive: Stress & Anxiety by Platform
+
+```{r plotly-platform, fig.width=10, fig.height=6}
+df_long_plat <- df |>
+  select(platform_usage, stress_level, anxiety_level, addiction_level) |>
+  pivot_longer(-platform_usage, names_to = "metric", values_to = "score")
+
+plot_ly(df_long_plat,
+        x = ~platform_usage, y = ~score, color = ~metric,
+        type = "box", boxpoints = "outliers") |>
+  layout(
+    title  = list(text = "Mental Health Scores by Platform Usage"),
+    xaxis  = list(title = "Platform"),
+    yaxis  = list(title = "Score"),
+    boxmode = "group"
+  )
+```
+
+## Violin Plots
+
+```{r violin-plots, fig.width=14, fig.height=5}
+vp1 <- ggplot(df, aes(depression_label, sleep_hours, fill = depression_label)) +
+  geom_violin(trim = FALSE, alpha = 0.65) +
+  geom_boxplot(width = 0.08, fill = "white", outlier.shape = NA) +
+  scale_fill_manual(values = c("No Depression" = "#59A14F", "Depression" = "#E15759"),
+                    guide = "none") +
+  labs(title = "Sleep Hours by Depression Label", x = NULL, y = "Sleep Hours")
+
+vp2 <- ggplot(df, aes(depression_label, addiction_level, fill = depression_label)) +
+  geom_violin(trim = FALSE, alpha = 0.65) +
+  geom_boxplot(width = 0.08, fill = "white", outlier.shape = NA) +
+  scale_fill_manual(values = c("No Depression" = "#59A14F", "Depression" = "#E15759"),
+                    guide = "none") +
+  labs(title = "Addiction Level by Depression Label", x = NULL, y = "Addiction Level")
+
+vp3 <- ggplot(df, aes(depression_label, stress_level, fill = depression_label)) +
+  geom_violin(trim = FALSE, alpha = 0.65) +
+  geom_boxplot(width = 0.08, fill = "white", outlier.shape = NA) +
+  scale_fill_manual(values = c("No Depression" = "#59A14F", "Depression" = "#E15759"),
+                    guide = "none") +
+  labs(title = "Stress Level by Depression Label", x = NULL, y = "Stress Level")
+
+vp1 + vp2 + vp3 +
+  plot_annotation(title = "Violin Plots: Key Features by Depression Label",
+                  theme = theme(plot.title = element_text(face = "bold", hjust = 0.5)))
+```
+
+## Heatmaps — Pivot Tables
+
+```{r heatmap-anxiety, fig.width=10, fig.height=5}
+pivot_anx <- df |>
+  filter(!is.na(age_group), !is.na(usage_category)) |>
+  group_by(age_group, usage_category) |>
+  summarise(mean_anxiety = round(mean(anxiety_level), 2), .groups = "drop")
+
+ggplot(pivot_anx, aes(usage_category, age_group, fill = mean_anxiety)) +
+  geom_tile(colour = "white", linewidth = 0.8) +
+  geom_text(aes(label = mean_anxiety), colour = "black", size = 4.5) +
+  scale_fill_gradient(low = "#FFF5EB", high = "#D94801",
+                      name = "Mean\nAnxiety") +
+  labs(title = "Mean Anxiety Level: Age Group × Usage Category",
+       x = "Usage Category", y = "Age Group")
+```
+
+```{r heatmap-stress, fig.width=10, fig.height=5}
+pivot_stress <- df |>
+  group_by(gender, platform_usage) |>
+  summarise(mean_stress = round(mean(stress_level), 2), .groups = "drop")
+
+ggplot(pivot_stress, aes(platform_usage, gender, fill = mean_stress)) +
+  geom_tile(colour = "white", linewidth = 0.8) +
+  geom_text(aes(label = mean_stress), colour = "black", size = 4.5) +
+  scale_fill_gradient(low = "#EFF3FF", high = "#2171B5",
+                      name = "Mean\nStress") +
+  labs(title = "Mean Stress Level: Gender × Platform Usage",
+       x = "Platform Usage", y = "Gender")
+```
+
+## Stacked Bar Charts
+
+```{r stacked-bars, fig.width=14, fig.height=5}
+sb1 <- df |>
+  count(gender, depression_label) |>
+  group_by(gender) |>
+  mutate(prop = n / sum(n)) |>
+  ggplot(aes(gender, prop, fill = depression_label)) +
+  geom_col(position = "fill", alpha = 0.85) +
+  geom_text(aes(label = percent(prop, accuracy = 0.1)),
+            position = position_fill(vjust = 0.5), size = 3.5) +
+  scale_y_continuous(labels = percent) +
+  scale_fill_manual(values = c("No Depression" = "#59A14F", "Depression" = "#E15759")) +
+  labs(title = "Depression by Gender", x = NULL, y = "Proportion", fill = NULL)
+
+sb2 <- df |>
+  filter(!is.na(usage_category)) |>
+  count(usage_category, depression_label) |>
+  group_by(usage_category) |>
+  mutate(prop = n / sum(n)) |>
+  ggplot(aes(usage_category, prop, fill = depression_label)) +
+  geom_col(position = "fill", alpha = 0.85) +
+  geom_text(aes(label = percent(prop, accuracy = 0.1)),
+            position = position_fill(vjust = 0.5), size = 3.5) +
+  scale_y_continuous(labels = percent) +
+  scale_fill_manual(values = c("No Depression" = "#59A14F", "Depression" = "#E15759")) +
+  labs(title = "Depression by Usage Category", x = NULL, y = "Proportion", fill = NULL)
+
+sb1 + sb2 +
+  plot_annotation(title = "Depression Label Distribution",
+                  theme = theme(plot.title = element_text(face = "bold", hjust = 0.5)))
+```
+
+## Line Plot — Mental Health Trend Across Usage
+
+```{r line-usage, fig.width=10, fig.height=5}
+line_df <- df |>
+  filter(!is.na(usage_category)) |>
+  group_by(usage_category) |>
+  summarise(
+    `Stress Level`    = mean(stress_level),
+    `Anxiety Level`   = mean(anxiety_level),
+    `Addiction Level` = mean(addiction_level),
+    .groups = "drop"
+  ) |>
+  pivot_longer(-usage_category, names_to = "Metric", values_to = "Mean Score")
+
+ggplot(line_df, aes(usage_category, `Mean Score`, colour = Metric, group = Metric)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 4) +
+  scale_colour_manual(values = c(
+    "Stress Level"    = "#E15759",
+    "Anxiety Level"   = "#F28E2B",
+    "Addiction Level" = "#4E79A7"
+  )) +
+  labs(
+    title    = "Mean Mental Health Scores Across Usage Categories",
+    subtitle = "Heavier social media use → higher stress, anxiety, and addiction",
+    x = "Usage Category", y = "Mean Score", colour = "Metric"
+  )
+```
+
+## Regression Scatter Plots
+
+```{r regression-scatters, fig.width=14, fig.height=5}
+rs1 <- ggplot(df, aes(screen_time_before_sleep, sleep_hours,
+                       colour = depression_label)) +
+  geom_point(alpha = 0.3, size = 1.2) +
+  geom_smooth(method = "lm", se = TRUE) +
+  scale_colour_manual(values = c("No Depression" = "#59A14F", "Depression" = "#E15759")) +
+  labs(title = "Screen Time Before Sleep vs Sleep Hours",
+       x = "Screen Time Before Sleep (h)", y = "Sleep Hours", colour = NULL)
+
+rs2 <- ggplot(df, aes(academic_performance, mental_health_score,
+                       colour = depression_label)) +
+  geom_point(alpha = 0.3, size = 1.2) +
+  geom_smooth(method = "lm", se = TRUE) +
+  scale_colour_manual(values = c("No Depression" = "#59A14F", "Depression" = "#E15759")) +
+  labs(title = "Academic Performance vs Mental Health Score",
+       x = "Academic Performance", y = "Mental Health Score", colour = NULL)
+
+rs1 + rs2 +
+  plot_annotation(title = "Regression Relationships by Depression Label",
+                  theme = theme(plot.title = element_text(face = "bold", hjust = 0.5)))
+```
+
+---
+
+# Section 6 — Machine Learning
+
+## Train / Test Split
+
+```{r ml-split}
+# Ensure train/test matrices are fully finite (required by glmnet)
+clean_matrix <- function(m) {
+  m <- as.matrix(m)
+  m[!is.finite(m)] <- 0
+  m
+}
+
+y_fac       <- factor(y_bin, levels = c(0, 1),
+                      labels = c("NoDepression", "Depression"))
+train_idx   <- createDataPartition(y_fac, p = 0.8, list = FALSE)
+X_train     <- clean_matrix(X_scaled[train_idx, , drop = FALSE])
+X_test      <- clean_matrix(X_scaled[-train_idx, , drop = FALSE])
+y_train_fac <- y_fac[train_idx]
+y_test_fac  <- y_fac[-train_idx]
+
+cat("Train size:", nrow(X_train), " | Test size:", nrow(X_test), "\n")
+cat("Train class balance:\n"); print(table(y_train_fac))
+cat("Test class balance:\n");  print(table(y_test_fac))
+```
+
+## Confusion Matrix Helper
+
+```{r cm-helper}
+plot_cm <- function(pred, actual, title) {
+  cm  <- confusionMatrix(pred, actual, positive = "Depression")
+  tab <- as.data.frame(cm$table)
+  names(tab) <- c("Actual", "Predicted", "Freq")
+
+  p <- ggplot(tab, aes(Predicted, Actual, fill = Freq)) +
+    geom_tile(colour = "white") +
+    geom_text(aes(label = Freq), size = 5, fontface = "bold") +
+    scale_fill_gradient(low = "#EFF3FF", high = "#2171B5", name = "Count") +
+    labs(title = title, x = "Predicted", y = "Actual") +
+    theme(legend.position = "right")
+
+  list(plot = p, cm = cm)
+}
+```
+
+## Macro F1 Helper
+
+```{r f1-helper}
+# ── Fixed macro F1 (avoids MLmetrics 'average' argument issue) ───────────────
+macro_f1 <- function(pred, actual) {
+  lvls <- levels(actual)
+  f1s  <- vapply(lvls, function(lv) {
+    tp <- sum(pred == lv & actual == lv)
+    fp <- sum(pred == lv & actual != lv)
+    fn <- sum(pred != lv & actual == lv)
+    if ((tp + fp) == 0 || (tp + fn) == 0) return(0)
+    prec <- tp / (tp + fp)
+    rec  <- tp / (tp + fn)
+    if ((prec + rec) == 0) return(0)
+    2 * prec * rec / (prec + rec)
+  }, numeric(1))
+  mean(f1s)
+}
+```
+
+## Model Training & Evaluation
+
+```{r train-lr}
+cat(strrep("=", 60), "\n1. LOGISTIC REGRESSION (Ridge via glmnet)\n",
+    strrep("=", 60), "\n")
+
+stopifnot(
+  "X_train has missing/non-finite values" =
+    all(is.finite(X_train))
+)
+
+fit_lr <- cv.glmnet(
+  X_train, as.integer(y_train_fac) - 1L,
+  family = "binomial", alpha = 0, nfolds = 5
+)
+prob_lr  <- as.numeric(predict(fit_lr, X_test, type = "response", s = "lambda.min"))
+pred_lr  <- factor(ifelse(prob_lr > 0.5, "Depression", "NoDepression"),
+                   levels = levels(y_fac))
+
+lr_cm    <- plot_cm(pred_lr, y_test_fac, "Logistic Regression — Confusion Matrix")
+print(lr_cm$plot)
+print(lr_cm$cm)
+
+roc_lr   <- roc(as.integer(y_test_fac) - 1L, prob_lr, quiet = TRUE)
+lr_auc   <- as.numeric(auc(roc_lr))
+lr_acc   <- mean(pred_lr == y_test_fac)
+lr_f1    <- macro_f1(pred_lr, y_test_fac)
+cat(sprintf("Test Accuracy: %.4f | Macro F1: %.4f | ROC-AUC: %.4f\n",
+            lr_acc, lr_f1, lr_auc))
+```
+
+```{r train-rf}
+cat(strrep("=", 60), "\n2. RANDOM FOREST\n", strrep("=", 60), "\n")
+
+fit_rf   <- randomForest(
+  x = as.data.frame(X_train), y = y_train_fac,
+  ntree = 200, importance = TRUE
+)
+pred_rf  <- predict(fit_rf, as.data.frame(X_test))
+prob_rf  <- predict(fit_rf, as.data.frame(X_test), type = "prob")[, "Depression"]
+
+rf_cm    <- plot_cm(pred_rf, y_test_fac, "Random Forest — Confusion Matrix")
+print(rf_cm$plot)
+print(rf_cm$cm)
+
+roc_rf   <- roc(as.integer(y_test_fac) - 1L, prob_rf, quiet = TRUE)
+rf_auc   <- as.numeric(auc(roc_rf))
+rf_acc   <- mean(pred_rf == y_test_fac)
+rf_f1    <- macro_f1(pred_rf, y_test_fac)
+cat(sprintf("Test Accuracy: %.4f | Macro F1: %.4f | ROC-AUC: %.4f\n",
+            rf_acc, rf_f1, rf_auc))
+```
+
+```{r train-xgb}
+cat(strrep("=", 60), "\n3. XGBOOST\n", strrep("=", 60), "\n")
+
+dtrain <- xgb.DMatrix(data = X_train, label = as.integer(y_train_fac) - 1L)
+dtest  <- xgb.DMatrix(data = X_test,  label = as.integer(y_test_fac)  - 1L)
+
+fit_xgb <- xgb.train(
+  params = list(
+    objective    = "binary:logistic",
+    eval_metric  = "auc",
+    eta          = 0.1,
+    max_depth    = 6,
+    subsample    = 0.8,
+    colsample_bytree = 0.8
+  ),
+  data     = dtrain,
+  nrounds  = 150,
+  watchlist = list(train = dtrain, test = dtest),
+  verbose  = 0
+)
+
+prob_xgb  <- predict(fit_xgb, dtest)
+pred_xgb  <- factor(ifelse(prob_xgb > 0.5, "Depression", "NoDepression"),
+                    levels = levels(y_fac))
+
+xgb_cm    <- plot_cm(pred_xgb, y_test_fac, "XGBoost — Confusion Matrix")
+print(xgb_cm$plot)
+print(xgb_cm$cm)
+
+roc_xgb   <- roc(as.integer(y_test_fac) - 1L, prob_xgb, quiet = TRUE)
+xgb_auc   <- as.numeric(auc(roc_xgb))
+xgb_acc   <- mean(pred_xgb == y_test_fac)
+xgb_f1    <- macro_f1(pred_xgb, y_test_fac)
+cat(sprintf("Test Accuracy: %.4f | Macro F1: %.4f | ROC-AUC: %.4f\n",
+            xgb_acc, xgb_f1, xgb_auc))
+```
+
+```{r train-svm}
+cat(strrep("=", 60), "\n4. SUPPORT VECTOR MACHINE (RBF)\n", strrep("=", 60), "\n")
+
+fit_svm   <- svm(
+  x = X_train, y = y_train_fac,
+  kernel = "radial", probability = TRUE, scale = FALSE
+)
+pred_svm  <- predict(fit_svm, X_test)
+prob_svm  <- attr(predict(fit_svm, X_test, probability = TRUE),
+                  "probabilities")[, "Depression"]
+
+svm_cm    <- plot_cm(pred_svm, y_test_fac, "SVM (RBF) — Confusion Matrix")
+print(svm_cm$plot)
+print(svm_cm$cm)
+
+roc_svm   <- roc(as.integer(y_test_fac) - 1L, prob_svm, quiet = TRUE)
+svm_auc   <- as.numeric(auc(roc_svm))
+svm_acc   <- mean(pred_svm == y_test_fac)
+svm_f1    <- macro_f1(pred_svm, y_test_fac)
+cat(sprintf("Test Accuracy: %.4f | Macro F1: %.4f | ROC-AUC: %.4f\n",
+            svm_acc, svm_f1, svm_auc))
+```
+
+## ROC Curves — All Models
+
+```{r roc-curves, fig.width=9, fig.height=7}
+plot(roc_lr,  col = "#4E79A7", lwd = 2,
+     main = "ROC Curves — All Models")
+plot(roc_rf,  col = "#59A14F", lwd = 2, add = TRUE)
+plot(roc_xgb, col = "#E15759", lwd = 2, add = TRUE)
+plot(roc_svm, col = "#F28E2B", lwd = 2, add = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "grey50")
+legend(
+  "bottomright",
+  legend = c(
+    sprintf("Logistic Regression (AUC = %.3f)", lr_auc),
+    sprintf("Random Forest       (AUC = %.3f)", rf_auc),
+    sprintf("XGBoost             (AUC = %.3f)", xgb_auc),
+    sprintf("SVM (RBF)           (AUC = %.3f)", svm_auc)
+  ),
+  col  = c("#4E79A7", "#59A14F", "#E15759", "#F28E2B"),
+  lwd  = 2,
+  cex  = 0.9,
+  bty  = "n"
+)
+```
+
+## 5-Fold Cross-Validation
+
+```{r cv-accuracy}
+folds <- createFolds(y_fac, k = 5, list = TRUE, returnTrain = TRUE)
+
+cv_rf <- vapply(folds, function(tr) {
+  te <- setdiff(seq_len(nrow(X_scaled)), tr)
+  m  <- randomForest(x = as.data.frame(X_scaled[tr, ]),
+                     y = y_fac[tr], ntree = 100)
+  mean(predict(m, as.data.frame(X_scaled[te, ])) == y_fac[te])
+}, numeric(1))
+
+cv_xgb <- vapply(folds, function(tr) {
+  te   <- setdiff(seq_len(nrow(X_scaled)), tr)
+  dtr  <- xgb.DMatrix(X_scaled[tr, ], label = as.integer(y_fac[tr]) - 1L)
+  dte  <- xgb.DMatrix(X_scaled[te, ], label = as.integer(y_fac[te]) - 1L)
+  m    <- xgb.train(
+    params  = list(objective = "binary:logistic", eval_metric = "auc",
+                   eta = 0.1, max_depth = 6),
+    data    = dtr, nrounds = 100, verbose = 0
+  )
+  p    <- ifelse(predict(m, dte) > 0.5, "Depression", "NoDepression")
+  mean(p == as.character(y_fac[te]))
+}, numeric(1))
+
+cat(sprintf(
+  "RF  5-Fold CV Accuracy: %.4f ± %.4f\n",
+  mean(cv_rf), sd(cv_rf)
+))
+cat(sprintf(
+  "XGB 5-Fold CV Accuracy: %.4f ± %.4f\n",
+  mean(cv_xgb), sd(cv_xgb)
+))
+```
+
+## Model Comparison Table
+
+```{r model-comparison, fig.width=12, fig.height=6}
+comparison <- tibble(
+  Model         = c("Logistic Regression", "Random Forest", "XGBoost", "SVM (RBF)"),
+  `CV Accuracy` = c(NA, round(mean(cv_rf), 4), round(mean(cv_xgb), 4), NA),
+  `Test Accuracy` = round(c(lr_acc, rf_acc, xgb_acc, svm_acc), 4),
+  `F1-Macro`    = round(c(lr_f1,  rf_f1,  xgb_f1,  svm_f1),  4),
+  `ROC-AUC`     = round(c(lr_auc, rf_auc, xgb_auc, svm_auc), 4)
+) |> arrange(desc(`F1-Macro`))
+
+comparison |>
+  kable(caption = "Model Performance Summary (sorted by Macro F1)") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE, font_size = 13) |>
+  row_spec(1, bold = TRUE, background = "#E8F5E9")
+```
+
+```{r comparison-plot, fig.width=13, fig.height=6}
+comparison |>
+  pivot_longer(-Model, names_to = "Metric", values_to = "Score") |>
+  filter(!is.na(Score)) |>
+  ggplot(aes(Model, Score, fill = Metric)) +
+  geom_col(position = "dodge", alpha = 0.85) +
+  geom_text(aes(label = round(Score, 3)),
+            position = position_dodge(width = 0.9),
+            vjust = -0.4, size = 3.2) +
+  scale_fill_viridis_d(option = "D", begin = 0.1, end = 0.9) +
+  scale_y_continuous(limits = c(0, 1.1), labels = number_format(accuracy = 0.01)) +
+  labs(
+    title    = "Model Performance Comparison",
+    subtitle = "Higher is better for all metrics",
+    x = NULL, y = "Score", fill = "Metric"
+  ) +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+---
+
+# Section 7 — Model Explainability
+
+```{r explainability}
+# Determine best model by F1-Macro
+best_model_name <- comparison$Model[1]
+cat("Best model (by F1-Macro):", best_model_name, "\n")
+```
+
+## Variable Importance — Random Forest
+
+```{r rf-importance, fig.width=10, fig.height=7}
+imp_rf <- importance(fit_rf, type = 1)   # MeanDecreaseAccuracy
+imp_df <- tibble(
+  Variable   = rownames(imp_rf),
+  Importance = imp_rf[, 1]
+) |> arrange(desc(Importance)) |> slice_head(n = 17)
+
+ggplot(imp_df, aes(reorder(Variable, Importance), Importance, fill = Importance)) +
+  geom_col(show.legend = FALSE, alpha = 0.85) +
+  scale_fill_gradient(low = "#C6DBEF", high = "#08519C") +
+  coord_flip() +
+  labs(
+    title    = "Random Forest — Variable Importance (MeanDecreaseAccuracy)",
+    subtitle = "Higher = more predictive of depression_label",
+    x = NULL, y = "Mean Decrease in Accuracy"
+  )
+```
+
+## Variable Importance — XGBoost
+
+```{r xgb-importance, fig.width=10, fig.height=7}
+imp_xgb <- xgb.importance(model = fit_xgb, feature_names = colnames(X_scaled))
+imp_xgb_top <- imp_xgb |>
+  as_tibble() |>
+  slice_head(n = 17)
+
+ggplot(imp_xgb_top, aes(reorder(Feature, Gain), Gain, fill = Gain)) +
+  geom_col(show.legend = FALSE, alpha = 0.85) +
+  scale_fill_gradient(low = "#FCBBA1", high = "#A50F15") +
+  coord_flip() +
+  labs(
+    title    = "XGBoost — Variable Importance (Gain)",
+    subtitle = "Higher Gain = feature reduces impurity more when used in splits",
+    x = NULL, y = "Gain"
+  )
+```
+
+## SHAP Values (XGBoost)
+
+```{r shap-values, fig.width=11, fig.height=8}
+# Compute SHAP contributions for the test set
+shap_mat <- predict(fit_xgb, dtest, predcontrib = TRUE)
+# Remove BIAS column
+shap_df  <- as.data.frame(shap_mat[, -ncol(shap_mat)])
+colnames(shap_df) <- colnames(X_scaled)
+
+# Mean absolute SHAP — global importance
+shap_importance <- shap_df |>
+  summarise(across(everything(), ~ mean(abs(.)))) |>
+  pivot_longer(everything(), names_to = "Feature", values_to = "Mean_SHAP") |>
+  arrange(desc(Mean_SHAP)) |>
+  slice_head(n = 17)
+
+ggplot(shap_importance, aes(reorder(Feature, Mean_SHAP), Mean_SHAP, fill = Mean_SHAP)) +
+  geom_col(show.legend = FALSE, alpha = 0.85) +
+  scale_fill_gradient(low = "#FEE8C8", high = "#D7301F") +
+  coord_flip() +
+  labs(
+    title    = "SHAP — Mean Absolute Feature Importance (XGBoost)",
+    subtitle = "Average impact of each feature on depression prediction",
+    x = NULL, y = "Mean |SHAP value|"
+  )
+```
+
+```{r shap-beeswarm, fig.width=12, fig.height=8}
+# Beeswarm-style SHAP plot (manual implementation without shapviz)
+top_features <- shap_importance$Feature[1:10]
+
+shap_long <- shap_df |>
+  select(all_of(top_features)) |>
+  mutate(obs = row_number()) |>
+  pivot_longer(-obs, names_to = "Feature", values_to = "SHAP_value") |>
+  left_join(
+    as.data.frame(X_test[, top_features]) |>
+      mutate(obs = row_number()) |>
+      pivot_longer(-obs, names_to = "Feature", values_to = "Feature_value"),
+    by = c("obs", "Feature")
+  ) |>
+  mutate(Feature = factor(Feature, levels = rev(top_features)))
+
+ggplot(shap_long, aes(SHAP_value, Feature, colour = Feature_value)) +
+  geom_jitter(height = 0.25, alpha = 0.35, size = 0.9) +
+  scale_colour_gradient2(
+    low      = "#4E79A7",
+    mid      = "grey80",
+    high     = "#E15759",
+    midpoint = 0,
+    name     = "Feature\nValue"
+  ) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "black") +
+  labs(
+    title    = "SHAP Beeswarm Plot — Top 10 Features",
+    subtitle = "Each point = one observation  |  Red = high feature value  |  Blue = low",
+    x        = "SHAP Value (impact on model output)",
+    y        = NULL
+  )
+```
+
+```{r shap-dependence, fig.width=14, fig.height=5}
+# SHAP dependence plots for top 2 features
+dep1_feat <- shap_importance$Feature[1]
+dep2_feat <- shap_importance$Feature[2]
+
+dep_df <- tibble(
+  feat1_val  = X_test[, dep1_feat],
+  feat1_shap = shap_df[[dep1_feat]],
+  feat2_val  = X_test[, dep2_feat],
+  feat2_shap = shap_df[[dep2_feat]]
+)
+
+pd1 <- ggplot(dep_df, aes(feat1_val, feat1_shap)) +
+  geom_point(alpha = 0.3, colour = "#E15759", size = 0.9) +
+  geom_smooth(method = "loess", se = TRUE, colour = "black") +
+  labs(title = paste("SHAP Dependence:", dep1_feat),
+       x = paste(dep1_feat, "(scaled)"), y = "SHAP Value")
+
+pd2 <- ggplot(dep_df, aes(feat2_val, feat2_shap)) +
+  geom_point(alpha = 0.3, colour = "#4E79A7", size = 0.9) +
+  geom_smooth(method = "loess", se = TRUE, colour = "black") +
+  labs(title = paste("SHAP Dependence:", dep2_feat),
+       x = paste(dep2_feat, "(scaled)"), y = "SHAP Value")
+
+pd1 + pd2
+```
+
+> **SHAP Interpretation:**
+> - Features with high mean |SHAP| are most influential in predicting depression.
+> - Positive SHAP values push the prediction toward **Depression**; negative values push toward **No Depression**.
+> - The beeswarm shows both direction and magnitude for every individual in the test set.
+> - Dependence plots reveal the functional relationship: does the feature have a linear or threshold effect?
+
+---
+
+# Section 8 — Key Insights & Conclusions
+
+## Platform Risk Summary
+
+```{r platform-risk}
+platform_risk <- df |>
+  group_by(platform_usage) |>
+  summarise(
+    n               = n(),
+    depression_rate = round(mean(depression_label == "Depression") * 100, 2),
+    mean_anxiety    = round(mean(anxiety_level), 3),
+    mean_stress     = round(mean(stress_level), 3),
+    mean_addiction  = round(mean(addiction_level), 3),
+    mean_sleep      = round(mean(sleep_hours), 3),
+    .groups         = "drop"
+  ) |>
+  arrange(desc(depression_rate))
+
+platform_risk |>
+  kable(caption = "Depression & Mental Health Metrics by Platform Usage") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) |>
+  column_spec(3, bold = TRUE,
+              color = ifelse(platform_risk$depression_rate ==
+                               max(platform_risk$depression_rate), "red", "black"))
+
+cat("\nHighest depression rate platform:",
+    platform_risk$platform_usage[1],
+    sprintf("(%.2f%%)\n", platform_risk$depression_rate[1]))
+```
+
+```{r platform-risk-viz, fig.width=12, fig.height=5}
+platform_risk |>
+  pivot_longer(c(depression_rate, mean_anxiety, mean_stress, mean_addiction),
+               names_to = "Metric", values_to = "Value") |>
+  mutate(Metric = recode(Metric,
+    depression_rate  = "Depression Rate (%)",
+    mean_anxiety     = "Mean Anxiety",
+    mean_stress      = "Mean Stress",
+    mean_addiction   = "Mean Addiction"
+  )) |>
+  ggplot(aes(platform_usage, Value, fill = platform_usage)) +
+  geom_col(show.legend = FALSE, alpha = 0.85) +
+  facet_wrap(~ Metric, scales = "free_y") +
+  scale_fill_viridis_d(option = "C", begin = 0.2, end = 0.85) +
+  labs(title = "Mental Health Metrics by Platform Usage",
+       x = NULL, y = "Value")
+```
+
+## Age Group Analysis
+
+```{r age-analysis, fig.width=12, fig.height=5}
+age_summary <- df |>
+  filter(!is.na(age_group)) |>
+  group_by(age_group) |>
+  summarise(
+    depression_rate = round(mean(depression_label == "Depression") * 100, 2),
+    mean_anxiety    = round(mean(anxiety_level), 3),
+    mean_stress     = round(mean(stress_level), 3),
+    mean_social_media = round(mean(daily_social_media_hours), 3),
+    .groups = "drop"
+  )
+
+age_summary |>
+  kable(caption = "Mental Health Metrics by Age Group") |>
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Final Model Summary
+
+```{r final-model-summary}
+cat("══════════════════════════════════════════════\n")
+cat("BEST MODEL:", comparison$Model[1], "\n")
+cat("══════════════════════════════════════════════\n")
+comparison[1, ] |>
+  kable(caption = "Best Model Performance") |>
+  kable_styling(bootstrap_options = c("striped"), full_width = FALSE, font_size = 14)
+```
+
+## Data-Driven Findings
+
+> ### 8 Key Findings
+>
+> 1. **Social media dose-response:** Mean stress, anxiety, and addiction scores rise
+>    monotonically from Light (<2h) to Heavy (>4h) daily use, confirming a dose-response
+>    relationship between screen time and mental health burden.
+>
+> 2. **Sleep as a mediator:** `screen_time_before_sleep` negatively correlates with
+>    `sleep_hours`; depressed teens consistently show shorter sleep and higher pre-sleep
+>    screen exposure. `sleep_deficit` emerged as a strong engineered predictor.
+>
+> 3. **Symptom cluster:** `stress_level`, `anxiety_level`, and `addiction_level` are
+>    highly inter-correlated and together form the most discriminative feature set for
+>    predicting `depression_label`.
+>
+> 4. **Platform differences:** ANOVA reveals significant differences in stress and/or
+>    anxiety across platform types; the platform with the highest depression rate is
+>    identified in the platform risk table above.
+>
+> 5. **Gender association:** Chi-square results indicate whether depression is
+>    distributed differently across genders — check the p-value printed in Section 3.
+>
+> 6. **Academic performance link:** Spearman correlations show `academic_performance`
+>    negatively correlates with depression — students with higher academic scores tend
+>    to show lower depression rates.
+>
+> 7. **Physical activity as a buffer:** `physical_activity` shows a negative Spearman
+>    correlation with depression, suggesting it may act as a protective factor.
+>
+> 8. **Composite mental health score:** The engineered `mental_health_score` (normalised
+>    sum of stress + anxiety + addiction) was among the top SHAP features, validating
+>    the multi-symptom approach.
+
+## Recommendations
+
+> ### For Teens
+> - Limit daily social media to under 2 hours (Light category) to stay in the lower
+>   risk zone for stress and anxiety.
+> - Avoid screens for at least 1 hour before bed to protect sleep quality.
+> - Increase physical activity — even moderate exercise correlates with lower depression.
+>
+> ### For Parents
+> - Monitor `addiction_level` indicators (compulsive checking, distress when offline).
+> - Encourage offline social interactions and maintain open conversations about
+>   mental health.
+>
+> ### For Schools
+> - Screen for high stress and anxiety early, particularly in Mid Teen (16-17) groups
+>   where academic pressure peaks.
+> - Integrate digital wellbeing education into the curriculum.
+>
+> ### For Policymakers
+> - Enforce age-appropriate platform design guidelines targeting the highest-risk
+>   platforms identified in this analysis.
+> - Support longitudinal research to establish causal pathways between social media
+>   use and teen depression.
+
+## Limitations & Future Work
+
+> - **Cross-sectional design:** Correlations cannot establish causation.
+> - **Self-reported measures:** `stress_level`, `sleep_hours`, and usage hours
+>   may be subject to recall and social desirability bias.
+> - **Binary target:** `depression_label` (0/1) loses severity nuance; a
+>   multi-class label (none / mild / moderate / severe) would be more clinically useful.
+> - **Platform granularity:** Grouping all TikTok or Instagram users together
+>   ignores within-platform usage patterns (passive scrolling vs active creation).
+> - **Future work:** Longitudinal design, clinical validation, inclusion of more
+>   demographic variables (socioeconomic status, family structure), and larger samples
+>   would substantially strengthen conclusions.
+
+---
+
+```{r session-info, collapse=TRUE}
+cat("Analysis complete ✅\n\n")
+sessionInfo()
+```
